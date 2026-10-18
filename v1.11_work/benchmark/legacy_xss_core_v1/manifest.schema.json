@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/legacy_xss_core_v1.schema.json",
+  "title": "legacy_xss_core_v1 case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "benchmark_id", "case_id", "selection_status", "plugin_slug", "plugin_name", "vendor_or_author", "code_lineage_id", "vulnerability_id", "vulnerability_class", "primary_advisory_urls", "affected_version_evidence", "official_source", "vulnerable_artifact", "runtime_compatibility_evidence", "evaluation_mode", "attack_conditions", "ground_truth", "strata", "implementation_fit", "review"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "benchmark_id": {"const": "legacy_xss_core_v1"},
+    "case_id": {"type": "string", "pattern": "^wp-plugin:[a-z0-9-]+:[^:]+:[^:]+$"},
+    "selection_status": {"enum": ["candidate", "eligible", "frozen", "rejected", "hold"]},
+    "plugin_slug": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+    "plugin_name": {"type": "string", "minLength": 1},
+    "vendor_or_author": {"type": "string", "minLength": 1},
+    "code_lineage_id": {"type": "string", "minLength": 1},
+    "vulnerability_id": {"type": "string", "minLength": 1},
+    "vulnerability_class": {"const": "XSS"},
+    "primary_advisory_urls": {"type": "array", "minItems": 1, "items": {"type": "string", "format": "uri"}},
+    "affected_version_evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["urls", "conclusion"],
+      "properties": {
+        "urls": {"type": "array", "minItems": 1, "items": {"type": "string", "format": "uri"}},
+        "conclusion": {"type": "string", "minLength": 1}
+      }
+    },
+    "official_source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "identity", "tag", "resolved_url", "final_url"],
+      "properties": {
+        "kind": {"enum": ["wordpress_org_tag", "vendor_release", "official_repo_tag"]},
+        "identity": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "minLength": 1},
+        "resolved_url": {"type": "string", "format": "uri"},
+        "final_url": {"type": "string", "format": "uri"}
+      }
+    },
+    "vulnerable_artifact": {"$ref": "#/$defs/artifact"},
+    "fixed_artifact": {"$ref": "#/$defs/artifact"},
+    "runtime_compatibility_evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["files_inspected", "conclusion", "reviewer_model"],
+      "properties": {
+        "files_inspected": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "conclusion": {"type": "string", "minLength": 1},
+        "reviewer_model": {"type": "string", "minLength": 1}
+      }
+    },
+    "evaluation_mode": {"enum": ["positive_only", "paired"]},
+    "attack_conditions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["attacker_role", "victim_role", "victim_action", "persistence", "is_self_xss"],
+      "properties": {
+        "attacker_role": {"type": "string", "minLength": 1},
+        "victim_role": {"type": "string", "minLength": 1},
+        "victim_action": {"type": "string", "minLength": 1},
+        "persistence": {"enum": ["reflected", "stored"]},
+        "is_self_xss": {"const": false}
+      }
+    },
+    "ground_truth": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "sink", "evidence"],
+      "properties": {
+        "source": {"$ref": "#/$defs/location"},
+        "sink": {"$ref": "#/$defs/sinkLocation"},
+        "additional_sinks": {"type": "array", "items": {"$ref": "#/$defs/sinkLocation"}},
+        "evidence": {"type": "string", "minLength": 1},
+        "fix_diff": {
+          "type": ["string", "object", "null"],
+          "additionalProperties": false,
+          "required": ["fixed_tag", "summary"],
+          "properties": {
+            "fixed_tag": {"type": "string", "minLength": 1},
+            "summary": {"type": "string", "minLength": 1},
+            "source_url": {"type": "string", "format": "uri"}
+          }
+        }
+      }
+    },
+    "strata": {
+      "type": "object", "additionalProperties": false,
+      "required": ["release_band", "access", "contexts"],
+      "properties": {
+        "release_band": {"enum": ["pre_2010", "2010_2014", "2015_2019"]},
+        "access": {"enum": ["unauthenticated", "low_privilege", "authenticated", "admin_victim", "unknown"]},
+        "contexts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"enum": ["html_text", "textarea", "html_attribute", "url_attribute", "javascript", "event_attribute", "shortcode_return"]}
+        }
+      }
+    },
+    "implementation_fit": {"enum": ["unclassified", "directly_modeled", "partially_modeled", "not_currently_modeled"]},
+    "review": {
+      "type": "object", "additionalProperties": false,
+      "required": ["luna_collected", "terra_verified", "sol_approved", "notes"],
+      "properties": {
+        "luna_collected": {"type": "boolean"},
+        "terra_verified": {"type": "boolean"},
+        "sol_approved": {"type": "boolean"},
+        "notes": {"type": "string"}
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "release_date", "source_url", "local_path", "sha256", "requires_php", "requires_wp", "tested_up_to"],
+      "properties": {
+        "version": {"type": "string", "minLength": 1},
+        "release_date": {"type": "string", "format": "date"},
+        "source_url": {"type": "string", "format": "uri"},
+        "local_path": {"type": "string", "pattern": "^cases/[^/]+/artifacts/(?:vulnerable|fixed)\\.zip$"},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "requires_php": {"type": ["string", "null"]},
+        "requires_wp": {"type": ["string", "null"]},
+        "tested_up_to": {"type": ["string", "null"]}
+      }
+    },
+    "location": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "line", "function", "expression"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "line": {"type": "integer", "minimum": 1},
+        "function": {"type": ["string", "null"]},
+        "expression": {"type": "string", "minLength": 1}
+      }
+    },
+    "sinkLocation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "line", "function", "expression", "context"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "line": {"type": "integer", "minimum": 1},
+        "function": {"type": ["string", "null"]},
+        "expression": {"type": "string", "minLength": 1},
+        "context": {"enum": ["html_text", "textarea", "html_attribute", "url_attribute", "javascript", "event_attribute", "shortcode_return"]}
+      }
+    }
+  }
+}

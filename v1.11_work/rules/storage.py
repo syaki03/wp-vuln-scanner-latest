@@ -1,0 +1,27 @@
+STORAGE = {
+    "writes": [
+        r"\bupdate_option\s*\(",
+        r"\badd_option\s*\(",
+        r"\bupdate_site_option\s*\(",
+        r"\badd_site_option\s*\(",
+        r"\bupdate_blog_option\s*\(",
+        r"\bupdate_post_meta\s*\(",
+        r"\badd_post_meta\s*\(",
+        r"\bupdate_user_meta\s*\(",
+        r"\badd_user_meta\s*\(",
+        r"\bupdate_term_meta\s*\(",
+        r"\badd_term_meta\s*\(",
+        r"\bset_transient\s*\(",
+        r"\bset_site_transient\s*\(",
+    ],
+    "reads": [
+        r"\bget_option\s*\(",
+        r"\bget_site_option\s*\(",
+        r"\bget_blog_option\s*\(",
+        r"\bget_post_meta\s*\(",
+        r"\bget_user_meta\s*\(",
+        r"\bget_term_meta\s*\(",
+        r"\bget_transient\s*\(",
+        r"\bget_site_transient\s*\(",
+    ],
+}

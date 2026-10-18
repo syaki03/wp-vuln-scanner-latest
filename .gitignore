@@ -1,0 +1,29 @@
+# Python caches and local environments
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Scanner inputs and generated reports
+v1.11_work/plugins/
+v1.11_work/output/
+
+# Review and benchmark data are local; reusable scripts remain tracked
+v1.11_work/review/*
+!v1.11_work/review/scripts/
+!v1.11_work/review/scripts/*.py
+v1.11_work/benchmark/*
+!v1.11_work/benchmark/legacy_xss_core_v1/
+v1.11_work/benchmark/legacy_xss_core_v1/*
+!v1.11_work/benchmark/legacy_xss_core_v1/manifest.schema.json
+!v1.11_work/benchmark/legacy_xss_core_v1/scripts/
+!v1.11_work/benchmark/legacy_xss_core_v1/scripts/*.py
+!v1.11_work/benchmark/legacy_xss_core_v1/scripts/*.ps1
+
+# Local research artifacts
+deliverables/
+work/
+reviews_v2/

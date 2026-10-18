@@ -25,6 +25,8 @@ MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_MEMBERS = 25_000
 MAX_COMPRESSION_RATIO = 2_000
+SLUG_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 
 MANIFEST_FIELDS = (
     "candidate_rank",
@@ -80,14 +82,54 @@ def sha256_file(path: Path) -> str:
 
 
 def tree_fingerprint(root: Path) -> str:
+    if is_link(root):
+        raise ValueError(f"tree root may not be linked: {root}")
+    files = []
+    for path in root.rglob("*"):
+        if is_link(path):
+            raise ValueError(f"tree contains a link: {path}")
+        if path.is_file():
+            files.append(path)
     digest = hashlib.sha256()
-    for path in sorted((item for item in root.rglob("*") if item.is_file()), key=lambda p: p.as_posix().casefold()):
+    for path in sorted(files, key=lambda p: p.as_posix().casefold()):
         relative = path.relative_to(root).as_posix()
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(bytes.fromhex(sha256_file(path)))
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def validate_identity(slug: str, version: str | None = None) -> None:
+    if not isinstance(slug, str) or SLUG_PATTERN.fullmatch(slug) is None:
+        raise ValueError(f"unsafe plugin slug: {slug!r}")
+    if version is not None and (
+        not isinstance(version, str) or VERSION_PATTERN.fullmatch(version) is None
+    ):
+        raise ValueError(f"unsafe plugin version: {version!r}")
+
+
+def is_link(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    # Path.is_junction is unavailable on the supported Python 3.11 baseline.
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def direct_child(root: Path, name: str) -> Path:
+    """Reject linked/escaping output entries before reading or modifying them."""
+    if is_link(root):
+        raise ValueError(f"output root may not be linked: {root}")
+    resolved_root = root.resolve()
+    child = resolved_root / name
+    if is_link(child) or child.resolve().parent != resolved_root:
+        raise ValueError(f"output child may not be linked or escape its root: {child}")
+    return child
 
 
 def read_cohort(path: Path, limit: int) -> list[dict[str, str]]:
@@ -113,6 +155,10 @@ def read_cohort(path: Path, limit: int) -> list[dict[str, str]]:
     slugs = [row["slug"] for row in rows]
     if len(slugs) != len(set(slugs)):
         raise ValueError("cohort contains duplicate slugs")
+    for row in rows:
+        if not isinstance(row["version"], str):
+            raise ValueError("plugin version must be a non-empty string")
+        validate_identity(row["slug"], row["version"])
     return rows
 
 
@@ -131,7 +177,7 @@ def download(url: str, destination: Path, timeout: float, retries: int) -> tuple
     if destination.exists():
         return url, destination.stat().st_size
     partial = destination.with_suffix(destination.suffix + ".partial")
-    if partial.exists():
+    if partial.exists() or is_link(partial):
         partial.unlink()
     destination.parent.mkdir(parents=True, exist_ok=True)
     last_error = ""
@@ -158,7 +204,7 @@ def download(url: str, destination: Path, timeout: float, retries: int) -> tuple
             return final_url, total
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
-            if partial.exists():
+            if partial.exists() or is_link(partial):
                 partial.unlink()
             if attempt < retries:
                 time.sleep(min(3.0, attempt))
@@ -166,6 +212,7 @@ def download(url: str, destination: Path, timeout: float, retries: int) -> tuple
 
 
 def safe_members(archive: zipfile.ZipFile, expected_slug: str) -> tuple[list[tuple[zipfile.ZipInfo, PurePosixPath]], str, int]:
+    validate_identity(expected_slug)
     infos = archive.infolist()
     if len(infos) > MAX_MEMBERS:
         raise ValueError(f"archive has too many members: {len(infos)}")
@@ -178,8 +225,8 @@ def safe_members(archive: zipfile.ZipFile, expected_slug: str) -> tuple[list[tup
         pure = PurePosixPath(info.filename.replace("\\", "/"))
         if pure.is_absolute() or not pure.parts or ".." in pure.parts:
             raise ValueError(f"unsafe ZIP member: {info.filename}")
-        if re.match(r"^[A-Za-z]:", pure.parts[0]):
-            raise ValueError(f"drive-qualified ZIP member: {info.filename}")
+        if any(":" in part for part in pure.parts):
+            raise ValueError(f"drive-qualified or alternate-stream ZIP member: {info.filename}")
         roots.add(pure.parts[0])
         mode = (info.external_attr >> 16) & 0xFFFF
         if mode and stat.S_ISLNK(mode):
@@ -207,24 +254,56 @@ def safe_members(archive: zipfile.ZipFile, expected_slug: str) -> tuple[list[tup
     return members, archive_root, uncompressed
 
 
-def extract_archive(zip_path: Path, plugin_root: Path, slug: str) -> tuple[int, int, str]:
-    destination = plugin_root / slug
-    if destination.exists():
-        return (
-            sum(1 for item in destination.rglob("*") if item.is_file()),
-            sum(item.stat().st_size for item in destination.rglob("*") if item.is_file()),
-            slug,
+def require_matching_extraction(
+    archive: zipfile.ZipFile,
+    members: list[tuple[zipfile.ZipInfo, PurePosixPath]],
+    destination: Path,
+) -> None:
+    if not destination.is_dir():
+        raise ValueError(f"existing extraction is not a directory: {destination}")
+    expected = {PurePosixPath(*pure.parts[1:]).as_posix(): info for info, pure in members}
+    actual: dict[str, Path] = {}
+    for item in destination.rglob("*"):
+        if is_link(item):
+            raise ValueError(f"existing extraction contains a link: {item}")
+        if item.is_file():
+            actual[item.relative_to(destination).as_posix()] = item
+        elif not item.is_dir():
+            raise ValueError(f"existing extraction contains an unsupported entry: {item}")
+    mismatch = set(expected) != set(actual)
+    if not mismatch:
+        for relative, info in expected.items():
+            with archive.open(info) as handle:
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != sha256_file(actual[relative]):
+                mismatch = True
+                break
+    if mismatch:
+        raise ValueError(
+            "existing extraction does not match ZIP; preserve it and use a new output directory"
         )
-    staging = plugin_root / f".{slug}.staging"
+
+
+def extract_archive(zip_path: Path, plugin_root: Path, slug: str) -> tuple[int, int, str]:
+    validate_identity(slug)
+    destination = direct_child(plugin_root, slug)
+    staging = direct_child(plugin_root, f".{slug}.staging")
     if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
+        raise ValueError(f"existing staging directory must be preserved: {staging}")
+    created_staging = False
     try:
         with zipfile.ZipFile(zip_path) as archive:
+            members, archive_root, uncompressed = safe_members(archive, slug)
             bad = archive.testzip()
             if bad:
                 raise ValueError(f"corrupt ZIP member: {bad}")
-            members, archive_root, uncompressed = safe_members(archive, slug)
+            if destination.exists():
+                require_matching_extraction(archive, members, destination)
+                return len(members), uncompressed, archive_root
+            staging.mkdir(parents=True)
+            created_staging = True
             for info, pure in members:
                 relative = PurePosixPath(*pure.parts[1:])
                 if not relative.parts:
@@ -236,7 +315,9 @@ def extract_archive(zip_path: Path, plugin_root: Path, slug: str) -> tuple[int, 
         staging.replace(destination)
         return len(members), uncompressed, archive_root
     except Exception:
-        if staging.exists():
+        if created_staging and staging.exists():
+            # Only this invocation's staging directory is eligible for cleanup.
+            direct_child(plugin_root, staging.name)
             shutil.rmtree(staging)
         raise
 
@@ -289,12 +370,13 @@ def scanner_target_count(root: Path) -> int:
 
 
 def receipt_path(receipt_root: Path, slug: str) -> Path:
-    return receipt_root / f"{slug}.json"
+    validate_identity(slug)
+    return direct_child(receipt_root, f"{slug}.json")
 
 
 def write_receipt(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.partial")
+    temporary = direct_child(path.parent, path.with_suffix(".json.partial").name)
     temporary.write_text(
         json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -304,25 +386,48 @@ def write_receipt(path: Path, value: dict[str, Any]) -> None:
 
 def process_candidate(row: dict[str, str], args: argparse.Namespace) -> dict[str, Any]:
     slug = row["slug"]
+    if not isinstance(row["version"], str):
+        raise ValueError("plugin version must be a non-empty string")
+    validate_identity(slug, row["version"])
+    validate_download_url(row["download_link"])
+    zip_path = direct_child(args.output_dir / "downloads", f"{slug}.{row['version']}.zip")
+    plugin_root = args.output_dir / "plugins"
+    plugin_path = direct_child(plugin_root, slug)
     receipts = args.output_dir / "artifact-receipts"
     existing_receipt = receipt_path(receipts, slug)
+    archive_identity_conflict = False
     if existing_receipt.exists():
         previous = json.loads(existing_receipt.read_text(encoding="utf-8"))
-        previous_zip = Path(str(previous.get("zip_path", "")))
-        previous_plugin = Path(str(previous.get("plugin_path", "")))
+        # One local ZIP filename cannot establish provenance for two requests.
+        # Preserve the original receipt as well as the bytes, so retries cannot
+        # silently relabel the cached file after an initial conflict.
+        if zip_path.is_file() and previous.get("zip_path") == str(zip_path):
+            archive_identity_conflict = (
+                previous.get("slug"), previous.get("api_version"), previous.get("download_url")
+            ) != (slug, row["version"], row["download_link"])
         if (
             previous.get("artifact_status") == "ready"
-            and previous_zip.is_file()
-            and previous_plugin.is_dir()
-            and sha256_file(previous_zip) == previous.get("artifact_sha256")
-            and tree_fingerprint(previous_plugin) == previous.get("tree_sha256")
+            and previous.get("request") == row
+            and previous.get("zip_path") == str(zip_path)
+            and previous.get("plugin_path") == str(plugin_path)
+            and previous.get("api_version") == row["version"]
+            and previous.get("version_check") == "match"
+            and zip_path.is_file()
+            and plugin_path.is_dir()
+            and sha256_file(zip_path) == previous.get("artifact_sha256")
+            and tree_fingerprint(plugin_path) == previous.get("tree_sha256")
         ):
-            return previous
+            try:
+                extract_archive(zip_path, plugin_root, slug)
+            except (OSError, ValueError, zipfile.BadZipFile):
+                pass  # Rebuild an error receipt below, retaining the existing tree.
+            else:
+                if plugin_header_version(plugin_path, slug) == row["version"]:
+                    return previous
 
     checked_at = datetime.now(timezone.utc).isoformat()
-    zip_path = args.output_dir / "downloads" / f"{slug}.{row['version']}.zip"
-    plugin_path = args.output_dir / "plugins" / slug
     base: dict[str, Any] = {
+        "request": dict(row),
         "candidate_rank": row["candidate_rank"],
         "batch_id": row["batch_id"],
         "slug": slug,
@@ -353,6 +458,10 @@ def process_candidate(row: dict[str, str], args: argparse.Namespace) -> dict[str
         "checked_at_utc": checked_at,
     }
     try:
+        if archive_identity_conflict:
+            raise ValueError(
+                "cached archive identity conflicts with this request; use a new output directory"
+            )
         final_url, archive_bytes = download(
             row["download_link"], zip_path, args.timeout, args.retries
         )
@@ -367,6 +476,9 @@ def process_candidate(row: dict[str, str], args: argparse.Namespace) -> dict[str
             if not header_version
             else "mismatch"
         )
+        base.update(plugin_header_version=header_version, version_check=version_check)
+        if version_check != "match":
+            raise ValueError("plugin header version does not match requested version")
         syntax_hits = post_71_syntax_hits(plugin_path) if not row["requires_php"] else []
         if row["requires_php"]:
             compatibility = "metadata_requires_php_le_7_1"
@@ -396,7 +508,8 @@ def process_candidate(row: dict[str, str], args: argparse.Namespace) -> dict[str
         )
     except Exception as exc:
         base["error"] = f"{type(exc).__name__}: {exc}"
-    write_receipt(existing_receipt, base)
+    if not archive_identity_conflict:
+        write_receipt(existing_receipt, base)
     return base
 
 

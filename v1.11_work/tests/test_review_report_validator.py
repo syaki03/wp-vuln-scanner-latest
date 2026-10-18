@@ -44,7 +44,7 @@ class ReviewReportValidatorTests(unittest.TestCase):
         self.queue_record = {
             "plugin": "example",
             "plugin_path": str(self.plugin),
-            "plugin_fingerprint": "1" * 64,
+            "plugin_fingerprint": QUEUE.source_inventory(self.plugin)["plugin_fingerprint"],
             "selected_findings_fingerprint": "2" * 64,
             "finding_count": 3,
             "selected_finding_count": 3,
@@ -72,7 +72,7 @@ class ReviewReportValidatorTests(unittest.TestCase):
             "plugin": "example",
             "version": "1.0.0",
             "version_citation": {"file": "main.php", "start_line": 2, "end_line": 2, "expression": "Version: 1.0.0"},
-            "plugin_fingerprint": "1" * 64,
+            "plugin_fingerprint": self.queue_record["plugin_fingerprint"],
             "selected_findings_fingerprint": "2" * 64,
             "finding_ids": ["0123456789abcdef0123", "abcdef0123456789abcd"],
             "reviewed_at": "2026-08-31",
@@ -140,6 +140,8 @@ class ReviewReportValidatorTests(unittest.TestCase):
         self.source.write_bytes(
             b"<?php\n// Version: 1.0.0\n// legacy byte: \xfc\n$input = $_GET['q'];\necho $input;\n"
         )
+        self.queue_record["plugin_fingerprint"] = QUEUE.source_inventory(self.plugin)["plugin_fingerprint"]
+        self.write_queue()
         report = self.report()
         report["selected_finding_assessment"][0]["citations"][0].update(
             start_line=4, end_line=5
@@ -165,6 +167,35 @@ class ReviewReportValidatorTests(unittest.TestCase):
         )
         self.write_report(report)
         with self.assertRaisesRegex(ValueError, "not a literal substring"):
+            VALIDATOR.validate_review_report(self.queue_path, self.report_path)
+
+    def test_rejects_current_source_change_even_when_all_citations_still_match(self) -> None:
+        self.write_report()
+        original_queue = self.queue_path.read_bytes()
+        self.source.write_text(
+            "<?php\n// Version: 1.0.0\n"
+            "$input = $_GET['q']; $input = htmlspecialchars($input);\necho $input;\n",
+            encoding="utf-8",
+        )
+        self.assertNotEqual(
+            self.queue_record["plugin_fingerprint"],
+            QUEUE.source_inventory(self.plugin)["plugin_fingerprint"],
+        )
+        with self.assertRaisesRegex(ValueError, "stale review.*current source"):
+            VALIDATOR.validate_review_report(self.queue_path, self.report_path)
+        with patch.object(sys, "argv", ["record_review", "--queue", str(self.queue_path), "--report", str(self.report_path)]):
+            with self.assertRaisesRegex(ValueError, "stale review.*current source"):
+                RECORD.main()
+        self.assertEqual(original_queue, self.queue_path.read_bytes())
+
+    def test_rejects_changed_module_even_when_report_cites_unchanged_php(self) -> None:
+        module = self.plugin / "render.module"
+        module.write_text("<?php echo $_GET['q'];\n", encoding="utf-8")
+        self.queue_record["plugin_fingerprint"] = QUEUE.source_inventory(self.plugin)["plugin_fingerprint"]
+        self.write_queue()
+        self.write_report()
+        module.write_text("<?php echo htmlspecialchars($_GET['q']);\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "stale review.*current source"):
             VALIDATOR.validate_review_report(self.queue_path, self.report_path)
 
     def test_rejects_schema_binding_and_finding_integrity_failures(self) -> None:

@@ -8,11 +8,14 @@ from scanner.reporter import write_reports
 from scanner.utils import plugin_name_from_path
 
 def main():
-    if not PLUGIN_ROOT.exists():
-        print(f"[ERROR] Plugin root does not exist: {PLUGIN_ROOT}")
+    if not PLUGIN_ROOT.is_dir():
+        print(f"[ERROR] Plugin root must be an existing directory: {PLUGIN_ROOT}")
         return 1
 
     files = collect_php_files(PLUGIN_ROOT)
+    if not files:
+        print(f"[ERROR] No supported PHP source files found in: {PLUGIN_ROOT}")
+        return 1
     (
         shortcode_callbacks,
         registered_callbacks,
@@ -26,6 +29,7 @@ def main():
     print(f"[+] Found PHP files: {len(files)}")
 
     findings = []
+    scan_errors = 0
     for i, path in enumerate(files, start=1):
         try:
             plugin = plugin_name_from_path(path, PLUGIN_ROOT)
@@ -40,6 +44,7 @@ def main():
             if i % 100 == 0:
                 print(f"[+] Scanned {i}/{len(files)} files")
         except Exception as e:
+            scan_errors += 1
             findings.append({
                 "plugin": path.parts[-2] if len(path.parts) >= 2 else "",
                 "file": str(path),
@@ -71,15 +76,16 @@ def main():
     info = sum(1 for f in findings if f["severity"] == "INFO")
 
     print("=" * 60)
-    print("Scan completed")
+    print("Scan incomplete" if scan_errors else "Scan completed")
     print(f"Total  : {len(findings)}")
     print(f"HIGH   : {high}")
     print(f"MEDIUM : {medium}")
     print(f"LOW    : {low}")
     print(f"INFO   : {info}")
+    print(f"ERRORS : {scan_errors}")
     print(f"[+] Output written to: {OUTPUT_DIR.resolve()}")
     print("=" * 60)
-    return 0
+    return 2 if scan_errors else 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

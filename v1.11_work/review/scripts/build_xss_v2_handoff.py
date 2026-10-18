@@ -9,7 +9,7 @@ import re
 import stat
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 class HandoffBuildError(ValueError):
@@ -85,13 +85,25 @@ def safe_relative_path(value: str) -> str:
     return value
 
 
+def is_link(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0)
+    )
+
+
 def read_tree(root: Path) -> dict[str, bytes]:
+    if is_link(root):
+        raise HandoffBuildError(f"tree root may not be linked: {root}")
     resolved = root.resolve(strict=True)
     if resolved.is_symlink():
         raise HandoffBuildError(f"tree root may not be a symlink: {root}")
     result: dict[str, bytes] = {}
     for path in sorted(resolved.rglob("*")):
-        if path.is_symlink():
+        if is_link(path):
             raise HandoffBuildError(f"tree symlink rejected: {path}")
         if path.is_file():
             relative = safe_relative_path(path.relative_to(resolved).as_posix())
@@ -300,11 +312,44 @@ def validate_poc_xss_v2_contract(handoff: Mapping[str, Any]) -> None:
 
 
 def write_tree(root: Path, files: Mapping[str, bytes]) -> None:
+    if is_link(root):
+        raise HandoffBuildError(f'patched output root may not be linked: {root}')
+    if root.exists() and (not root.is_dir() or any(root.iterdir())):
+        raise HandoffBuildError(f'patched output root must be absent or empty: {root}')
+    relative_files = {safe_relative_path(name): content for name, content in files.items()}
     root.mkdir(parents=True, exist_ok=True)
-    for relative, content in files.items():
+    for relative, content in relative_files.items():
         path = root / PurePosixPath(relative)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
+    if read_tree(root) != relative_files:
+        raise HandoffBuildError('written patched tree does not match declared bytes')
+
+
+def validate_output_paths(
+    root: Path, outputs: Sequence[Path], *, input_files: Sequence[Path] = (), input_trees: Sequence[Path] = ()
+) -> None:
+    resolved_root = root.resolve()
+    resolved_outputs = [path.resolve() for path in outputs]
+    def aliases(first: Path, second: Path) -> bool:
+        return first == second or (first.exists() and second.exists() and first.samefile(second))
+
+    if any(aliases(first, second) for i, first in enumerate(resolved_outputs) for second in resolved_outputs[i + 1:]):
+        raise HandoffBuildError('handoff, patch and receipt output paths must be distinct')
+    if any(path == resolved_root or resolved_root in path.parents for path in resolved_outputs):
+        raise HandoffBuildError('metadata outputs must be outside the patched output tree')
+    for path in input_files:
+        resolved = path.resolve()
+        if any(aliases(output, resolved) for output in resolved_outputs):
+            raise HandoffBuildError('output paths must not alias input files')
+        if resolved == resolved_root or resolved_root in resolved.parents:
+            raise HandoffBuildError('patched output tree must not contain input files')
+    for tree in input_trees:
+        resolved = tree.resolve()
+        if resolved == resolved_root or resolved in resolved_root.parents or resolved_root in resolved.parents:
+            raise HandoffBuildError('patched output tree must not overlap input trees')
+        if any(path == resolved or resolved in path.parents for path in resolved_outputs):
+            raise HandoffBuildError('metadata outputs must not modify input trees')
 
 
 def build_handoff(
@@ -492,6 +537,11 @@ def main() -> int:
     parser.add_argument("--patch-output", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args()
+    validate_output_paths(
+        args.patched_output_root, [args.output, args.patch_output, args.receipt],
+        input_files=[args.spec, args.artifact_manifest, args.review, args.artifact_zip],
+        input_trees=[args.source_root, args.patched_root],
+    )
 
     spec_value = load_json_strict(args.spec)
     source_files = read_tree(args.source_root)
@@ -516,6 +566,9 @@ def main() -> int:
         patched_files=patched_files,
     )
     write_tree(args.patched_output_root, patched_files)
+    actual_hash = sha256_bytes(canonical_json(tree_manifest(read_tree(args.patched_output_root))))
+    if actual_hash != handoff['patched_control']['patched_tree_sha256']:
+        raise HandoffBuildError('written patched tree hash does not match handoff')
     write_json(args.output, handoff)
     args.patch_output.parent.mkdir(parents=True, exist_ok=True)
     args.patch_output.write_bytes(patch_bytes)
@@ -525,6 +578,7 @@ def main() -> int:
     receipt["artifact_manifest_raw_sha256"] = sha256_bytes(args.artifact_manifest.read_bytes())
     receipt["review_raw_sha256"] = sha256_bytes(args.review.read_bytes())
     receipt["patched_tree_derivation"] = "official_vulnerable_tree_plus_bound_sink_range_only"
+    receipt['checks'].append('written_patched_tree_exact_bytes')
     receipt["receipt_sha256"] = sha256_bytes(canonical_json({key: value for key, value in receipt.items() if key != "receipt_sha256"}))
     write_json(args.receipt, receipt)
     print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))

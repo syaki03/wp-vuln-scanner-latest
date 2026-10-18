@@ -51,6 +51,29 @@ python main.py
 - `findings.json`
 - `report.html`
 
+終了コードは、正常に全対象を解析できた場合が`0`、入力ルート不正または対象PHP系ファイルが0件の場合が`1`、ファイル単位の解析失敗がある場合が`2`です。候補が0件でも、対象ファイルを正常に解析できていれば`0`です。部分失敗時も3形式のレポートを残し、`SCAN_ERROR`とコンソールの`ERRORS`件数を確認できます。
+
+CSVは表計算ソフト向けの表示用です。数式として解釈され得る先頭文字や先頭制御文字を持つテキストへapostrophe（`'`）を付けます。数値型は変更しません。原文の引用・機械処理には`findings.json`を使ってください。JSONは原文を保持し、HTMLは表示時にescapeします。[CSV数式解釈の背景（OWASP）](https://community.owasp.org/attacks/CSV_Injection)
+
+## 候補キューとソースレビュー
+
+以下はリポジトリのルートで実行します。`--plugin-root`はスキャン時と同じディレクトリを指定してください。
+
+```powershell
+python .agents/skills/review-wp-vulnerability-candidates/scripts/build_review_queue.py --findings v1.11_work/output/findings.json --plugin-root "C:\path\to\plugins" --output v1.11_work/review/queue.jsonl --campaign operational-i53
+```
+
+`--findings`はJSON配列と従来のCSVを受け入れます。JSON入力はCSVと同じ選択規則・候補IDを使い、CSV表示用の変更を原文へ持ち込みません。`.php`、`.inc`、`.module`などの対象ソースからfingerprintを作ります。
+
+キュー生成はレビューそのものを実行しません。人またはCodexが、finding、スキャナ規則、プラグインの該当ソースと呼出経路を確認し、schema v2のreview reportを作成します。必要なfieldと合成例は[report validator](.agents/skills/review-wp-vulnerability-candidates/scripts/validate_review_report.py)と[テストのreport例](v1.11_work/tests/test_review_report_validator.py)を参照してください。候補ID、version引用、trace、一次情報などを実際の対象に合わせます。
+
+```powershell
+python .agents/skills/review-wp-vulnerability-candidates/scripts/validate_review_report.py --queue v1.11_work/review/queue.jsonl --report v1.11_work/review/example-review.json
+python .agents/skills/review-wp-vulnerability-candidates/scripts/record_review.py --queue v1.11_work/review/queue.jsonl --report v1.11_work/review/example-review.json
+```
+
+登録時はreportとqueueだけでなく、現在のソースfingerprintも照合します。ソースを編集した場合は再スキャン・キュー再生成・再レビューが必要です。スキャン中やレビュー登録中は対象ソースを変更しないでください。
+
 ## テスト
 
 `v1.11_work` から回帰テストを実行します。
@@ -64,6 +87,20 @@ python -m unittest -v
 ## Stored XSS handoff
 
 `v1.11_work/review/scripts/build_xss_v2_handoff.py`は、固定したソース、経路、対照patchなどから引き渡しデータを生成します。v2契約のrole、action identifier、environment role、sink contextに合わない値は生成前に拒否します。このチェックは、受け手のPoCプロジェクトによる正式なschema／semantic validationやruntime検証の代替ではありません。
+
+spec、artifact manifest、完成済みreview、公式ZIP、展開source、patch候補を用意して実行します。合成入力の構造は[handoffテスト](v1.11_work/tests/test_xss_v2_handoff.py)を参照できます。
+
+```powershell
+python v1.11_work/review/scripts/build_xss_v2_handoff.py --spec inputs/spec.json --artifact-manifest inputs/manifest.json --review inputs/review.json --artifact-zip inputs/official.zip --source-root inputs/source --patched-root inputs/patched-candidate --patched-output-root outputs/patched --output outputs/handoff.json --patch-output outputs/patch.diff --receipt outputs/receipt.json
+```
+
+`--patched-output-root`は存在しないか空のディレクトリが必要です。既存の内容を自動削除・上書きせず拒否し、書込み後のtree hashも検証します。handoff、patch、receiptはpatched treeの外へ別々のパスで保存してください。runtime PoCの実行機能は同梱していません。
+
+## 固定artifactの整合性
+
+`download_and_prepare_legacy_cohort.py`は、要求した版・URLとcacheを照合し、ZIP全ファイルと展開済みソースの一致を確認します。版の不一致や展開先の残存データがある場合は解析対象へ含めません。既存ソースやstagingディレクトリは保全するため、競合時は新しい`--output-dir`を指定してください。不正なslug／version、リンクによる出力先の逸脱も拒否します。
+
+`run_scanner_for_artifact_manifest.py`はmanifestと実ソースのhashをスキャン前後に照合します。不一致の場合は正常な`scan_run.json`を作成しません。sourceや版を変更した場合はartifact manifestも再生成してください。
 
 ## ベンチマークの入力
 

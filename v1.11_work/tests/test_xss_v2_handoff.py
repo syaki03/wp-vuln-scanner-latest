@@ -4,8 +4,10 @@ import importlib.util
 import io
 import json
 import sys
+import contextlib
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 from pathlib import Path
 
@@ -110,6 +112,94 @@ class XssV2HandoffTests(unittest.TestCase):
         self.spec["finding"]["finding_id"] = "fedcba98765432100123"
         with self.assertRaisesRegex(builder.HandoffBuildError, "not covered"):
             self.build()
+
+    def test_output_tree_rejects_existing_contents_without_modification(self) -> None:
+        output = self.root / 'patched-output'
+        output.mkdir()
+        stale = output / 'stale.txt'
+        stale.write_bytes(b'keep existing data')
+        with self.assertRaisesRegex(builder.HandoffBuildError, 'absent or empty'):
+            builder.write_tree(output, self.patched)
+        self.assertEqual(b'keep existing data', stale.read_bytes())
+        self.assertFalse((output / 'plugin.php').exists())
+
+    def test_output_tree_exactly_matches_declared_hash(self) -> None:
+        handoff, _, _ = self.build()
+        output = self.root / 'new-output'
+        builder.write_tree(output, self.patched)
+        actual = builder.sha256_bytes(builder.canonical_json(builder.tree_manifest(builder.read_tree(output))))
+        self.assertEqual(handoff['patched_control']['patched_tree_sha256'], actual)
+
+    def test_output_tree_detects_written_byte_mismatch(self) -> None:
+        with patch.object(builder, 'read_tree', return_value={'plugin.php': b'incorrect bytes'}):
+            with self.assertRaisesRegex(builder.HandoffBuildError, 'written patched tree'):
+                builder.write_tree(self.root / 'mismatch', self.patched)
+
+    def test_metadata_outputs_cannot_pollute_patched_tree(self) -> None:
+        output = self.root / 'patched-output'
+        with self.assertRaisesRegex(builder.HandoffBuildError, 'outside the patched'):
+            builder.validate_output_paths(output, [output / 'handoff.json', self.root / 'patch', self.root / 'receipt'])
+        with self.assertRaisesRegex(builder.HandoffBuildError, 'distinct'):
+            builder.validate_output_paths(output, [self.root / 'same', self.root / 'same', self.root / 'receipt'])
+
+    def test_cli_receipt_describes_actual_output_after_all_writes(self) -> None:
+        source = self.root / 'source'
+        patched = self.root / 'candidate'
+        builder.write_tree(source, self.source)
+        builder.write_tree(patched, self.patched)
+        for name, value in [('spec', self.spec), ('manifest', self.manifest), ('review', self.review)]:
+            builder.write_json(self.root / f'{name}.json', value)
+        archive = self.root / 'official.zip'
+        archive.write_bytes(self.zip_bytes)
+        output = self.root / 'patched-output'
+        handoff_path = self.root / 'handoff.json'
+        receipt_path = self.root / 'receipt.json'
+        argv = ['builder', '--spec', str(self.root / 'spec.json'), '--artifact-manifest', str(self.root / 'manifest.json'),
+                '--review', str(self.root / 'review.json'), '--artifact-zip', str(archive), '--source-root', str(source),
+                '--patched-root', str(patched), '--patched-output-root', str(output), '--output', str(handoff_path),
+                '--patch-output', str(self.root / 'patch.diff'), '--receipt', str(receipt_path)]
+        with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, builder.main())
+        handoff = builder.load_json_strict(handoff_path)
+        receipt = builder.load_json_strict(receipt_path)
+        actual = builder.sha256_bytes(builder.canonical_json(builder.tree_manifest(builder.read_tree(output))))
+        self.assertEqual(handoff['patched_control']['patched_tree_sha256'], actual)
+        self.assertIn('written_patched_tree_exact_bytes', receipt['checks'])
+        self.assertEqual(builder.sha256_bytes(builder.canonical_json({k: v for k, v in receipt.items() if k != 'receipt_sha256'})),
+                         receipt['receipt_sha256'])
+
+    def test_outputs_must_preserve_all_input_files_and_trees(self) -> None:
+        source = self.root / 'source'
+        source.mkdir()
+        original = source / 'plugin.php'
+        original.write_bytes(self.source['plugin.php'])
+        spec = self.root / 'spec.json'
+        spec.write_bytes(b'{"preserve": true}')
+        patched_output = self.root / 'output-tree'
+        outputs = [self.root / 'handoff.json', self.root / 'patch.diff', self.root / 'receipt.json']
+        for index in range(3):
+            invalid = list(outputs)
+            invalid[index] = spec
+            with self.subTest(index=index), self.assertRaisesRegex(builder.HandoffBuildError, 'alias input'):
+                builder.validate_output_paths(patched_output, invalid, input_files=[spec], input_trees=[source])
+        with self.assertRaisesRegex(builder.HandoffBuildError, 'modify input trees'):
+            builder.validate_output_paths(patched_output, [original, *outputs[1:]], input_trees=[source])
+        with self.assertRaisesRegex(builder.HandoffBuildError, 'overlap input trees'):
+            builder.validate_output_paths(source / 'nested-output', outputs, input_trees=[source])
+        self.assertEqual(b'{"preserve": true}', spec.read_bytes())
+        self.assertEqual(self.source['plugin.php'], original.read_bytes())
+
+    def test_hardlinked_output_cannot_alias_input(self) -> None:
+        spec = self.root / 'spec.json'
+        spec.write_bytes(b'{"preserve": true}')
+        alias = self.root / 'spec-hardlink.json'
+        try:
+            alias.hardlink_to(spec)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f'hardlink creation is unavailable: {type(error).__name__}')
+        with self.assertRaisesRegex(builder.HandoffBuildError, 'alias input'):
+            builder.validate_output_paths(self.root / 'output-tree', [alias, self.root / 'patch', self.root / 'receipt'], input_files=[spec])
+        self.assertEqual(b'{"preserve": true}', spec.read_bytes())
 
     def test_rejects_patch_outside_sink(self) -> None:
         self.patched["plugin.php"] = self.patched["plugin.php"].replace(b"<?php", b"<?PHP")

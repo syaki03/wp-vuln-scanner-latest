@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import unittest
+from contextlib import chdir
 from pathlib import Path
 
 
@@ -95,6 +96,72 @@ class ReviewQueueBuilderTests(unittest.TestCase):
         self.assertEqual("A_public_or_unauthenticated", records[0]["review_band"])
         self.assertEqual(0, records[0]["selection"]["max_findings_per_plugin"])
         self.assertEqual("public-high", summary["campaign"])
+
+    def test_json_and_csv_have_identical_selection_and_finding_ids(self) -> None:
+        row = self.row("example", "high_public")
+        row.update(entrypoint_line="0", snippet="echo $input;", optional="", enabled="False")
+        self.write_findings([row])
+        from_csv, _summary = QUEUE.build_queue(self.args())
+        raw = dict(row, line=10, score=70, entrypoint_line=0, optional=None, enabled=False)
+        json_path = self.root / "findings.json"
+        json_path.write_text(json.dumps([raw]), encoding="utf-8")
+        from_json, _summary = QUEUE.build_queue(self.args(findings=json_path))
+        # Provenance must identify the actual input artifact, whose bytes differ.
+        for records in (from_csv, from_json):
+            for record in records:
+                record.pop("source_findings_path")
+                record.pop("source_findings_sha256")
+        self.assertEqual(from_csv, from_json)
+        self.assertEqual("0", from_json[0]["findings"][0]["entrypoint_line"])
+
+    def test_json_preserves_formula_prefixes_in_raw_plugin_path_and_snippet(self) -> None:
+        plugin = "=example"
+        row = self.row(plugin, "high_public", file="=example/=render.php")
+        row["snippet"] = "=echo $_GET['q'];"
+        plugin_path = self.plugins / plugin
+        plugin_path.mkdir()
+        (plugin_path / "=render.php").write_text("<?php echo $_GET['q'];\n", encoding="utf-8")
+        json_path = self.root / "findings.json"
+        json_path.write_text(json.dumps([row]), encoding="utf-8")
+        with chdir(self.plugins):
+            records, _summary = QUEUE.build_queue(self.args(findings=json_path))
+        self.assertEqual(plugin, records[0]["plugin"])
+        self.assertEqual(str(plugin_path.resolve()), records[0]["plugin_path"])
+        self.assertTrue(records[0]["plugin_exists"])
+        selected = records[0]["findings"][0]
+        self.assertEqual(row["file"], selected["file"])
+        self.assertTrue(selected["file_within_plugin"])
+        self.assertEqual(row["snippet"], selected["snippet"])
+
+    def test_json_rejects_malformed_top_level_rows_and_non_scalar_values(self) -> None:
+        json_path = self.root / "findings.json"
+        good = self.row("example", "high_public")
+        for payload, message in (
+            ({"findings": []}, "findings JSON must be an array"),
+            ([1], "findings JSON row 1 must be an object"),
+            ([{}], "findings JSON row 1 is missing columns"),
+            ([dict(good, snippet=[])], "findings JSON row 1 field 'snippet' must be a scalar"),
+            ([dict(good, score=float("nan"))], "findings JSON.*non-finite"),
+        ):
+            with self.subTest(payload=payload):
+                json_path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, message):
+                    QUEUE.build_queue(self.args(findings=json_path))
+
+    def test_csv_does_not_remove_literal_apostrophe_prefix(self) -> None:
+        plugin = "'=example"
+        self.write_findings([self.row(plugin, "high_public")])
+        records, _summary = QUEUE.build_queue(self.args())
+        self.assertEqual(plugin, records[0]["plugin"])
+        self.assertTrue(records[0]["plugin_exists"])
+
+    def test_json_accepts_scanner_error_row_without_priority(self) -> None:
+        row = self.row("example", "", kind="SCAN_ERROR")
+        del row["poc_priority"]
+        json_path = self.root / "findings.json"
+        json_path.write_text(json.dumps([row]), encoding="utf-8")
+        records, _summary = QUEUE.build_queue(self.args(findings=json_path))
+        self.assertEqual([], records)
 
     def test_operational_accepts_all_findings_and_defaults_to_twelve(self) -> None:
         rows = [self.row("all", "skip_admin_only", line=index, flow="variable_assignment") for index in range(1, 15)]
@@ -196,6 +263,29 @@ class ReviewQueueBuilderTests(unittest.TestCase):
         self.assertEqual(0, summary["prior_reviews_reusable"])
         self.assertEqual(0, summary["prior_reviews_needing_delta"])
         self.assertEqual(0, summary["prior_reviews_rejected"])
+
+    def test_module_inventory_change_invalidates_existing_review(self) -> None:
+        self.write_findings([self.row("example", "high_public")])
+        module = self.plugins / "example" / "render.module"
+        module.write_text("<?php echo $_GET['q'];\n", encoding="utf-8")
+        records, _summary = QUEUE.build_queue(self.args())
+        self.assertEqual(2, records[0]["source_file_count"])
+        self.assertEqual(2, records[0]["php_file_count"])
+        self.assertEqual(
+            (self.plugins / "example" / "main.php").stat().st_size + module.stat().st_size,
+            records[0]["php_bytes"],
+        )
+        records[0]["review"] = {"status": "reviewed", "verdict": "possible_vulnerability"}
+        QUEUE.write_jsonl_atomic(self.output, records)
+        unchanged, _summary = QUEUE.build_queue(self.args())
+        self.assertTrue(unchanged[0]["review_state_preserved"])
+
+        module.write_text("<?php echo htmlspecialchars($_GET['q']);\n", encoding="utf-8")
+        changed, summary = QUEUE.build_queue(self.args())
+        self.assertNotEqual(records[0]["plugin_fingerprint"], changed[0]["plugin_fingerprint"])
+        self.assertFalse(changed[0]["review_state_preserved"])
+        self.assertEqual("pending", changed[0]["review"]["status"])
+        self.assertEqual(0, summary["preserved_reviews"])
 
     def test_prior_report_path_does_not_escape_or_recurse(self) -> None:
         prior_dir = (self.root / "prior").resolve()
